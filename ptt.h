@@ -1,23 +1,42 @@
 #ifndef _PTT_H
 #define _PTT_H
 
+#include <stddef.h>
 struct HttpServer;
 typedef struct HttpServer* HttpServerHandle;
 
+typedef enum
+{
+    HTTP_GET,
+    HTTP_POST
+} HttpRequestMethod;
+
+typedef enum
+{
+    HTTP_1_1,
+    HTTP_2_0
+} HttpVersion;
+
+
+
 typedef struct 
 {
-
-} PtthResponse;
-
-typedef struct 
-{
+    HttpRequestMethod method;
+    char resource[2048];
+    HttpVersion version;
     
-} PtthRequest;
 
+} HttpRequest;
 
-typedef PtthResponse (*HandleRequest)(PtthRequest);
+typedef struct
+{
+    unsigned int code;
+    HttpVersion version;
+    const char* content;
+    size_t contentLength;
+} HttpResponse;
+
  
-
 typedef struct
 {
     int port;
@@ -33,12 +52,12 @@ static void ptthProcess(void);
 #ifdef PTTH_IMPLEMENTATION
 
 #include <arpa/inet.h> //htons
+#include <assert.h>
 #include <errno.h> //errno
 #include <fcntl.h> //fcntl
 #include <netdb.h>
 #include <signal.h> //signal
 #include <stdarg.h> //va_start, va_list
-#include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h> //exit
@@ -70,6 +89,10 @@ struct HttpConnection
 
 static void acceptNewClient(void);
 static void closeConnection(struct HttpConnection*);
+static HttpRequest parseRequest(const char*);
+static void sendResponse(struct HttpConnection*, HttpResponse);
+static size_t getContent(const char*, char*);
+
 #ifndef PTTH_NO_SIGHANDLE
 static void ptthSignalHandler(int);
 #endif // PTTH_NO_SIGHANDLE
@@ -158,19 +181,44 @@ ptthProcess(void)
 
             char data[2048];
             int len = 0;
-            while((len = recv(connection->socket,data,sizeof(data),0)) < sizeof(data))
-            {
+            len = recv(connection->socket,data,sizeof(data),0);
+            
                 
-                if(len == 0)
-                {
-                    errno = 0;
-                    closeConnection(connection);
-                    break;
-                }
-
-                fprintf(stdout,"%s\n",data);
+            if(len == 0)
+            {
+               errno = 0;
+               closeConnection(connection);
+            
             }
-            if(errno != 0 )
+            else
+            {
+                HttpRequest request = parseRequest(data);
+                fprintf(stdout,"Resource: %s\n",request.resource);
+                if(request.method == HTTP_GET)
+                {
+                    fprintf(stdout,"GET Request\n");
+                    char* content = NULL;
+                    size_t contentLength = getContent(request.resource,content);
+                    sendResponse(connection,(HttpResponse){
+                        .code = 200,
+                        .version = request.version,
+                        .content = content,
+                        .contentLength = contentLength
+                    });
+                }
+                if(request.version == HTTP_1_1)
+                {
+                    fprintf(stdout,"Using HTTP/1.1\n");
+                }
+                
+
+                
+                closeConnection(connection);
+
+            }
+            //fprintf(stdout,"%s\n",data);
+            
+            if(errno != 0 && errno != EAGAIN )
             {
                 perror("recv()");
                
@@ -238,6 +286,79 @@ ptthSignalHandler(int)
     fprintf(stderr,"Closing PTTH server\n");
     close(server.socket);
     server.shutdown = 1;
+}
+
+static HttpRequest
+parseRequest(const char* data)
+{
+    HttpRequest request;
+    request.version = HTTP_1_1;
+    char* requestDup = strdup(data);
+    char* tokLast;
+    char* requestLine;
+    char method[5], version[16];
+
+    requestLine = strtok_r(requestDup,"\r\n",&tokLast);
+
+    fprintf(stderr,"%s\n",requestLine);
+    sscanf(requestLine,"%4s %2047s %15s",method,request.resource,version);
+    fprintf(stderr,"%s\n",request.resource);
+    if(strcmp(method,"GET") == 0)
+    {
+        request.method = HTTP_GET;
+    } 
+    else if(strcmp(method,"POST") == 0)
+    {
+        request.method = HTTP_POST;
+    }
+    else
+    {
+        fprintf(stderr,"Unknown http method: %s",method);
+    }
+
+    if(strcmp(version,"HTTP/1.1") == 0)
+    {
+        request.version = HTTP_1_1;
+    }
+    else
+    {
+        fprintf(stderr,"Unknown or unsupported HTTP version: %s",version);
+    }
+
+    free(requestDup);
+    return request;
+    
+}
+
+static void 
+sendResponse(struct HttpConnection* connection, HttpResponse response)
+{
+    const char htmlString[] = "<h1>PTTH!</h1>";
+
+    char* responseLine;
+    int responseLen = snprintf(NULL,0,"HTTP/1.1 %d OK\r\nConnection:close\r\nContent-Type:text/html\r\n\r\n",response.code);
+    if(responseLen < 0)
+    {
+        perror("snprintf()");
+        return;
+    }
+    responseLine = malloc((responseLen + 1) * sizeof(char));
+    responseLen = snprintf(responseLine,responseLen + 1,"HTTP/1.1 %d OK\r\nConnection:close\r\nContent-Type:text/html\r\n\r\n",response.code);
+    fprintf(stderr,"Sending: %s",responseLine);
+    //int result = sendto(server.socket,responseLine,responseLen,0,(struct sockaddr*)&connection->address,sizeof(connection->address));
+    int result = send(connection->socket,responseLine,responseLen, 0);
+    if(result < 0)
+    {
+        perror("sendto");
+    }
+    send(connection->socket,htmlString,sizeof(htmlString),0);
+    free(responseLine);
+}
+
+static size_t 
+getContent(const char* name, char* content)
+{
+    assert(0);
 }
 
 
