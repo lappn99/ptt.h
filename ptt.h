@@ -40,6 +40,7 @@ typedef struct
 typedef struct
 {
     int port;
+    const char* serverBaseDir;
 } PtthInitDesc;
 
 
@@ -55,6 +56,7 @@ static void ptthProcess(void);
 #include <assert.h>
 #include <errno.h> //errno
 #include <fcntl.h> //fcntl
+#include <limits.h> //PATH_MAX
 #include <netdb.h>
 #include <signal.h> //signal
 #include <stdarg.h> //va_start, va_list
@@ -62,10 +64,11 @@ static void ptthProcess(void);
 #include <stdint.h>
 #include <stdlib.h> //exit
 #include <string.h> // strerror
-#include  <sys/epoll.h>
+#include <sys/stat.h>
+#include <sys/epoll.h>
 #include <sys/socket.h> //socket
 #include <sys/types.h>
-#include <unistd.h> //close, fork
+#include <unistd.h> //close, fork, getcwd
 
 #ifndef PTTH_CONN_BACKLOG
 #define PTTH_CONN_BACKLOG 10
@@ -78,6 +81,8 @@ struct HttpServer
     int epoll;
 
     int shutdown;
+
+    int baseDir;
     
 };
 
@@ -91,13 +96,14 @@ static void acceptNewClient(void);
 static void closeConnection(struct HttpConnection*);
 static HttpRequest parseRequest(const char*);
 static void sendResponse(struct HttpConnection*, HttpResponse);
-static size_t getContent(const char*, char*);
+static size_t getContent(const char*, char**);
 
 #ifndef PTTH_NO_SIGHANDLE
 static void ptthSignalHandler(int);
 #endif // PTTH_NO_SIGHANDLE
 static struct HttpServer server;
 
+const char RESPONSE_404[] = "<h1>File not found</h1>";
 
 static int
 ptthInit(PtthInitDesc desc)
@@ -130,6 +136,19 @@ ptthInit(PtthInitDesc desc)
     ev.data = (epoll_data_t){.fd = server.socket};
     epoll_ctl(server.epoll,EPOLL_CTL_ADD,server.socket,&ev);
 
+    char baseDirPath[PATH_MAX];
+    getcwd(baseDirPath,PATH_MAX);
+    if(desc.serverBaseDir != NULL)
+    {
+        strncpy(baseDirPath,desc.serverBaseDir,PATH_MAX);
+    } 
+    server.baseDir = open(baseDirPath,O_DIRECTORY);
+    if(server.baseDir < 0)
+    {
+        perror("open()");
+    }
+
+
     #ifndef PTTH_NO_SIGHANDLE
     signal(SIGINT,ptthSignalHandler);
     signal(SIGQUIT,ptthSignalHandler);
@@ -157,6 +176,7 @@ static void
 ptthProcess(void)
 {
     #define MAX_EVENTS PTTH_CONN_BACKLOG + 1
+    
     int i;
     struct epoll_event pendingEvents[MAX_EVENTS];
     int numEvents = epoll_wait(server.epoll,pendingEvents,MAX_EVENTS,-1);
@@ -198,13 +218,23 @@ ptthProcess(void)
                 {
                     fprintf(stdout,"GET Request\n");
                     char* content = NULL;
-                    size_t contentLength = getContent(request.resource,content);
+                    size_t contentLength = getContent(request.resource,&content);
+                    int responseCode = 200;
+                    if(content == NULL)
+                    {
+                        responseCode = 404;
+                        
+                        content = strdup(RESPONSE_404);
+                        contentLength = sizeof(RESPONSE_404);
+
+                    }
                     sendResponse(connection,(HttpResponse){
-                        .code = 200,
+                        .code = responseCode,
                         .version = request.version,
                         .content = content,
                         .contentLength = contentLength
                     });
+                    free(content);
                 }
                 if(request.version == HTTP_1_1)
                 {
@@ -302,6 +332,10 @@ parseRequest(const char* data)
 
     fprintf(stderr,"%s\n",requestLine);
     sscanf(requestLine,"%4s %2047s %15s",method,request.resource,version);
+    if(strcmp(request.resource,"/") == 0)
+    {
+        strcpy(request.resource,"/index.html");
+    }
     fprintf(stderr,"%s\n",request.resource);
     if(strcmp(method,"GET") == 0)
     {
@@ -333,32 +367,92 @@ parseRequest(const char* data)
 static void 
 sendResponse(struct HttpConnection* connection, HttpResponse response)
 {
-    const char htmlString[] = "<h1>PTTH!</h1>";
 
     char* responseLine;
-    int responseLen = snprintf(NULL,0,"HTTP/1.1 %d OK\r\nConnection:close\r\nContent-Type:text/html\r\n\r\n",response.code);
+    char reasonPhrase[32];
+    const char responseFormat[] = "HTTP/1.1 %d %s\r\nConnection:close\r\nContent-Type:text/html\r\n\r\n";
+
+    switch(response.code)
+    {
+        case 200:
+            strcpy(reasonPhrase,"OK");
+            break;
+        case 404:
+            strcpy(reasonPhrase,"File not Found");
+            break;
+        default:
+            fprintf(stderr,"Unknown or unsupported response code: %d", response.code);
+            break;
+    }
+
+    int responseLen = snprintf(NULL,0,responseFormat,response.code,reasonPhrase);
     if(responseLen < 0)
     {
         perror("snprintf()");
         return;
     }
     responseLine = malloc((responseLen + 1) * sizeof(char));
-    responseLen = snprintf(responseLine,responseLen + 1,"HTTP/1.1 %d OK\r\nConnection:close\r\nContent-Type:text/html\r\n\r\n",response.code);
-    fprintf(stderr,"Sending: %s",responseLine);
-    //int result = sendto(server.socket,responseLine,responseLen,0,(struct sockaddr*)&connection->address,sizeof(connection->address));
+    responseLen = snprintf(responseLine,responseLen + 1,responseFormat,response.code,reasonPhrase);
+    
     int result = send(connection->socket,responseLine,responseLen, 0);
     if(result < 0)
     {
         perror("sendto");
     }
-    send(connection->socket,htmlString,sizeof(htmlString),0);
+    send(connection->socket,response.content,response.contentLength,0);
     free(responseLine);
 }
 
 static size_t 
-getContent(const char* name, char* content)
+getContent(const char* name, char** content)
 {
-    assert(0);
+    char* last;
+    char* path = strdup(name);
+    path = strtok_r(path,"/",&last);
+    int currentDir = server.baseDir;
+next_dir:
+    int file = openat(currentDir, path, O_RDONLY);
+    if(file == -1)
+    {
+        perror("openat()");
+        errno = 0;
+        return 0;
+    }
+
+    printf("%s\n",path); 
+    struct stat fileStat;
+    fstat(file, &fileStat);
+
+    if(S_ISDIR(fileStat.st_mode))
+    {
+        if(currentDir != server.baseDir)
+        {
+            close(currentDir);
+        }
+        
+        currentDir = file;
+        goto next_dir;
+    }
+    
+    if(currentDir != server.baseDir)
+    {
+        close(currentDir);
+    }
+
+    size_t contentSize;
+    off_t size = lseek(file,0,SEEK_END);
+    *content = malloc(sizeof(char) * (size + 1));
+    lseek(file,0,SEEK_SET);
+    if((contentSize = read(file, *content, size)) < 0)
+    {
+        perror("read()");
+        return 0;
+    }
+    fprintf(stderr,"Resource size: %lu\n",contentSize);
+    
+
+    close(file);
+    return size;
 }
 
 
