@@ -2,6 +2,7 @@
 #define _PTT_H
 
 #include <stddef.h>
+
 struct HttpServer;
 typedef struct HttpServer* HttpServerHandle;
 struct HttpConnection;
@@ -18,8 +19,6 @@ typedef enum
     HTTP_1_1,
     HTTP_2_0
 } HttpVersion;
-
-
 
 typedef struct 
 {
@@ -90,6 +89,7 @@ static void ptthProcess(void);
 #define PTTH_MAX_ROUTES 24
 #endif
 
+
 struct HttpServer 
 {
     int socket;   
@@ -131,10 +131,16 @@ ptthInit(PtthInitDesc desc)
         perror("socket()");
         return 0;
     }
+    
+    if(setsockopt(server.socket,SOL_SOCKET,SO_REUSEADDR,&(int){1},sizeof(int)) < 0)
+    {
+        perror("setsockopt()");
+    }
     server.shutdown = 0;
     server.address.sin_family = AF_INET;
     server.address.sin_port = htons(desc.port);
     server.address.sin_addr.s_addr = INADDR_ANY;
+    
 
     if(bind(server.socket,(const struct sockaddr*)&server.address,sizeof(server.address)) < 0)
     {

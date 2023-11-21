@@ -2,7 +2,7 @@
 #define PTTH_IMPLEMENTATION
 #include "../ptt.h"
 
-const char* callbackResponse = "<h1> callback success!</h1>";
+const char* callbackResponse = "<h1>callback success!</h1>";
 HttpResponse handleCallback(HttpConnectionHandle, HttpRequest);
 
 int main(int argc, char** argv)
@@ -35,10 +35,10 @@ int main(int argc, char** argv)
 HttpResponse handleCallback(HttpConnectionHandle, HttpRequest)
 {
     //const char response[] = "test";
-    printf("Handling /callback!");
+    printf("Handling /callback!\n");
     return (HttpResponse){
         .code = 200,
-        .content = "Test!",
-        .contentLength = 6
+        .content = callbackResponse,
+        .contentLength = strlen(callbackResponse)
     };
 }
