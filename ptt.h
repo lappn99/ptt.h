@@ -4,6 +4,8 @@
 #include <stddef.h>
 struct HttpServer;
 typedef struct HttpServer* HttpServerHandle;
+struct HttpConnection;
+typedef struct HttpConnection* HttpConnectionHandle;
 
 typedef enum
 {
@@ -31,16 +33,25 @@ typedef struct
 typedef struct
 {
     unsigned int code;
-    HttpVersion version;
     const char* content;
     size_t contentLength;
 } HttpResponse;
 
- 
+typedef struct
+{
+    HttpRequestMethod method;
+    const char* endPoint;
+    HttpResponse (*routeTarget)(HttpConnectionHandle, HttpRequest);
+
+} PtthRoute;
+
 typedef struct
 {
     int port;
     const char* serverBaseDir;
+    size_t numRoutes;
+    PtthRoute* routes;
+
 } PtthInitDesc;
 
 
@@ -48,6 +59,7 @@ static int ptthInit(PtthInitDesc);
 static void ptthDeinit(void);
 static int ptthContinue(void);
 static void ptthProcess(void);
+
 
 
 #ifdef PTTH_IMPLEMENTATION
@@ -74,15 +86,20 @@ static void ptthProcess(void);
 #define PTTH_CONN_BACKLOG 10
 #endif // PTTH_CONN_BACKLOG
 
+#ifndef PTTH_MAX_ROUTES
+#define PTTH_MAX_ROUTES 24
+#endif
+
 struct HttpServer 
 {
     int socket;   
     struct sockaddr_in address;
     int epoll;
-
     int shutdown;
-
     int baseDir;
+
+    PtthRoute routes[PTTH_MAX_ROUTES]; 
+    size_t numRoutes;
     
 };
 
@@ -90,6 +107,7 @@ struct HttpConnection
 {
     int socket;
     struct sockaddr_in address;
+    HttpVersion version;
 };
 
 static void acceptNewClient(void);
@@ -148,6 +166,8 @@ ptthInit(PtthInitDesc desc)
         perror("open()");
     }
 
+    memcpy(server.routes,desc.routes,sizeof(PtthRoute) * desc.numRoutes);
+    server.numRoutes = desc.numRoutes;
 
     #ifndef PTTH_NO_SIGHANDLE
     signal(SIGINT,ptthSignalHandler);
@@ -164,6 +184,7 @@ static void
 ptthDeinit(void)
 {
     close(server.socket);
+    close(server.baseDir);
 }
 
 static int
@@ -214,7 +235,21 @@ ptthProcess(void)
             {
                 HttpRequest request = parseRequest(data);
                 fprintf(stdout,"Resource: %s\n",request.resource);
-                if(request.method == HTTP_GET)
+                connection->version = request.version;
+                int routeHandled = 0;
+                for(int i = 0;i < server.numRoutes; i++)
+                {
+                    PtthRoute route = server.routes[i];
+                    if(strcmp(route.endPoint, request.resource) == 0 && route.method == request.method)
+                    {
+                        fprintf(stderr,"Routing request %s\n", request.resource);
+                        sendResponse(connection, route.routeTarget(connection,request));
+
+                        routeHandled = 1;
+                                 
+                    }
+                }
+                if(request.method == HTTP_GET && !routeHandled)
                 {
                     fprintf(stdout,"GET Request\n");
                     char* content = NULL;
@@ -222,27 +257,18 @@ ptthProcess(void)
                     int responseCode = 200;
                     if(content == NULL)
                     {
-                        responseCode = 404;
-                        
+                        responseCode = 404;                     
                         content = strdup(RESPONSE_404);
                         contentLength = sizeof(RESPONSE_404);
 
                     }
                     sendResponse(connection,(HttpResponse){
                         .code = responseCode,
-                        .version = request.version,
                         .content = content,
                         .contentLength = contentLength
                     });
                     free(content);
                 }
-                if(request.version == HTTP_1_1)
-                {
-                    fprintf(stdout,"Using HTTP/1.1\n");
-                }
-                
-
-                
                 closeConnection(connection);
 
             }
@@ -314,7 +340,12 @@ static void
 ptthSignalHandler(int)
 {
     fprintf(stderr,"Closing PTTH server\n");
-    close(server.socket);
+    shutdown(server.socket,SHUT_RDWR);
+    if(close(server.socket) < 0)
+    {
+        perror("close()");
+    }
+
     server.shutdown = 1;
 }
 
@@ -408,18 +439,18 @@ getContent(const char* name, char** content)
 {
     char* last;
     char* path = strdup(name);
-    path = strtok_r(path,"/",&last);
+    
+    char* currentPath = strtok_r(path,"/",&last);
     int currentDir = server.baseDir;
 next_dir:
-    int file = openat(currentDir, path, O_RDONLY);
+    int file = openat(currentDir, currentPath, O_RDONLY);
     if(file == -1)
     {
         perror("openat()");
-        errno = 0;
-        return 0;
+        goto get_content_error;
     }
 
-    printf("%s\n",path); 
+    printf("Path: %s\n",path); 
     struct stat fileStat;
     fstat(file, &fileStat);
 
@@ -429,7 +460,7 @@ next_dir:
         {
             close(currentDir);
         }
-        
+        currentPath = strtok_r(NULL,"/",&last); 
         currentDir = file;
         goto next_dir;
     }
@@ -446,13 +477,17 @@ next_dir:
     if((contentSize = read(file, *content, size)) < 0)
     {
         perror("read()");
-        return 0;
+        goto get_content_error;
     }
     fprintf(stderr,"Resource size: %lu\n",contentSize);
-    
-
+    free(path);    
     close(file);
     return size;
+get_content_error:
+    errno = 0;
+    free(path);
+    return 0;
+   
 }
 
 
