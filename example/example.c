@@ -3,7 +3,7 @@
 #include "../ptt.h"
 
 const char* callbackResponse = "<h1>callback success!</h1>";
-HttpResponse handleCallback(HttpConnectionHandle, HttpRequest);
+HttpResponse handleCallback(HttpConnectionHandle connection, HttpRequest* request);
 
 int main(int argc, char** argv)
 {
@@ -32,10 +32,11 @@ int main(int argc, char** argv)
 }
 
 
-HttpResponse handleCallback(HttpConnectionHandle, HttpRequest)
+HttpResponse handleCallback(HttpConnectionHandle connection, HttpRequest* request)
 {
+    
     //const char response[] = "test";
-    printf("Handling /callback!\n");
+    printf("Handling /callback!\nQuery string: %s\n",request->data.queryString);
     return (HttpResponse){
         .code = 200,
         .content = callbackResponse,

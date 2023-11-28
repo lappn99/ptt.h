@@ -20,13 +20,33 @@ typedef enum
     HTTP_2_0
 } HttpVersion;
 
+typedef struct
+{
+    const char* queryString;
+} HttpGetData;
+
+typedef struct
+{
+    const char* body;
+} HttpPostData;
+
+typedef struct
+{
+	char queryString[2048];
+	union
+	{
+		HttpGetData get;
+    	HttpPostData post;
+
+	};
+} RequestData;
+
 typedef struct 
 {
     HttpRequestMethod method;
-    char resource[2048];
+    char resource[2048]; //Max size of request
     HttpVersion version;
-    
-
+    RequestData data;
 } HttpRequest;
 
 typedef struct
@@ -34,31 +54,34 @@ typedef struct
     unsigned int code;
     const char* content;
     size_t contentLength;
+
 } HttpResponse;
 
 typedef struct
 {
     HttpRequestMethod method;
     const char* endPoint;
-    HttpResponse (*routeTarget)(HttpConnectionHandle, HttpRequest);
+    HttpResponse (*routeTarget)(HttpConnectionHandle, HttpRequest*);
 
 } PtthRoute;
 
 typedef struct
 {
-    int port;
-    const char* serverBaseDir;
+    int port; //Port to run server on
+    const char* serverBaseDir; //Will handle requests relative to this location
     size_t numRoutes;
-    PtthRoute* routes;
+    PtthRoute* routes; //Route handlers
 
 } PtthInitDesc;
 
 
 static int ptthInit(PtthInitDesc);
 static void ptthDeinit(void);
+// 1 if server has not shutdown
+// 0 if it has
 static int ptthContinue(void);
+//Proccess events again
 static void ptthProcess(void);
-
 
 
 #ifdef PTTH_IMPLEMENTATION
@@ -94,9 +117,9 @@ struct HttpServer
 {
     int socket;   
     struct sockaddr_in address;
-    int epoll;
-    int shutdown;
-    int baseDir;
+    int epoll; //Server epoll instance, watches for server and client events
+    int shutdown; //Is the server shutdown
+    int baseDir; 
 
     PtthRoute routes[PTTH_MAX_ROUTES]; 
     size_t numRoutes;
@@ -116,6 +139,7 @@ static HttpRequest parseRequest(const char*);
 static void sendResponse(struct HttpConnection*, HttpResponse);
 static size_t getContent(const char*, char**);
 
+
 #ifndef PTTH_NO_SIGHANDLE
 static void ptthSignalHandler(int);
 #endif // PTTH_NO_SIGHANDLE
@@ -126,22 +150,24 @@ const char RESPONSE_404[] = "<h1>File not found</h1>";
 static int
 ptthInit(PtthInitDesc desc)
 {
+    //Create TCP socket
     if((server.socket = socket(AF_INET,SOCK_STREAM,0)) < 0)
     {
         perror("socket()");
         return 0;
     }
     
+    //Make address re-usable, if the server is restarted alot, then binding can fail, this is to prevent that
     if(setsockopt(server.socket,SOL_SOCKET,SO_REUSEADDR,&(int){1},sizeof(int)) < 0)
     {
         perror("setsockopt()");
     }
+
     server.shutdown = 0;
     server.address.sin_family = AF_INET;
     server.address.sin_port = htons(desc.port);
     server.address.sin_addr.s_addr = INADDR_ANY;
     
-
     if(bind(server.socket,(const struct sockaddr*)&server.address,sizeof(server.address)) < 0)
     {
         perror("bind()");
@@ -153,24 +179,32 @@ ptthInit(PtthInitDesc desc)
         perror("listen()");
         return 0;
     }
+
     fprintf(stderr,"PTTH: Started server on port %d\n",desc.port);
+    //Create and configure epoll event for server 
     server.epoll = epoll_create1(0);
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLRDHUP;
     ev.data = (epoll_data_t){.fd = server.socket};
+
+    //Add server socket fd to epoll instance
     epoll_ctl(server.epoll,EPOLL_CTL_ADD,server.socket,&ev);
 
+    //If no base path was set in DESC then use the current working director as base path
     char baseDirPath[PATH_MAX];
     getcwd(baseDirPath,PATH_MAX);
     if(desc.serverBaseDir != NULL)
     {
         strncpy(baseDirPath,desc.serverBaseDir,PATH_MAX);
     } 
+
+    //Open the base directory
     server.baseDir = open(baseDirPath,O_DIRECTORY);
     if(server.baseDir < 0)
     {
         perror("open()");
     }
+
 
     memcpy(server.routes,desc.routes,sizeof(PtthRoute) * desc.numRoutes);
     server.numRoutes = desc.numRoutes;
@@ -206,7 +240,14 @@ ptthProcess(void)
     
     int i;
     struct epoll_event pendingEvents[MAX_EVENTS];
+
+    //Get all pending epoll events
     int numEvents = epoll_wait(server.epoll,pendingEvents,MAX_EVENTS,-1);
+    if(numEvents < 0)
+    {
+        perror("epoll_wait()");
+    }
+    printf("%d Events\n",numEvents);
     for(i = 0; i < numEvents; i++)
     {
         struct epoll_event event = pendingEvents[i];
@@ -214,6 +255,7 @@ ptthProcess(void)
         //Event on server socket
         if(event.data.fd == server.socket)
         {
+            printf("Accepting new client\n");
             //Socket is written to (new client)
             if(event.events & EPOLLIN)
             {
@@ -221,6 +263,7 @@ ptthProcess(void)
             }
             
         }
+        //Data coming in from client socket connection
         else if(event.events & EPOLLIN)
         {
             
@@ -241,6 +284,7 @@ ptthProcess(void)
             {
                 HttpRequest request = parseRequest(data);
                 fprintf(stdout,"Resource: %s\n",request.resource);
+                
                 connection->version = request.version;
                 int routeHandled = 0;
                 for(int i = 0;i < server.numRoutes; i++)
@@ -249,7 +293,7 @@ ptthProcess(void)
                     if(strcmp(route.endPoint, request.resource) == 0 && route.method == request.method)
                     {
                         fprintf(stderr,"Routing request %s\n", request.resource);
-                        sendResponse(connection, route.routeTarget(connection,request));
+                        sendResponse(connection, route.routeTarget(connection,&request));
 
                         routeHandled = 1;
                                  
@@ -322,6 +366,7 @@ acceptNewClient(void)
 
     connection->address = client;
     connection->socket = socket;
+    fprintf(stderr,"New client accepted on socket %d\n",connection->socket);
 
     struct epoll_event ev;
     ev.data.ptr = connection;
@@ -338,6 +383,7 @@ closeConnection(struct HttpConnection* connection)
 {
     struct epoll_event event;
     epoll_ctl(server.epoll,EPOLL_CTL_DEL,connection->socket,&event);
+    fprintf(stderr,"Closing connection on socket %d\n", connection->socket);
     close(connection->socket);
     free(connection);
 }
@@ -359,24 +405,39 @@ static HttpRequest
 parseRequest(const char* data)
 {
     HttpRequest request;
+	memset(&request,0, sizeof(HttpRequest));
     request.version = HTTP_1_1;
     char* requestDup = strdup(data);
     char* tokLast;
     char* requestLine;
     char method[5], version[16];
+	char url[2048];
+	char* queryString;
 
     requestLine = strtok_r(requestDup,"\r\n",&tokLast);
 
     fprintf(stderr,"%s\n",requestLine);
-    sscanf(requestLine,"%4s %2047s %15s",method,request.resource,version);
+    sscanf(requestLine,"%4s %2047s %15s",method,url,version);
+	if((queryString = strchr(url,'?')) == NULL)
+	{
+		strcpy(request.resource,url);
+	}
+	else
+	{
+		ptrdiff_t resourceStringSize = queryString - (char*)url;
+		strncpy(request.resource,url,resourceStringSize);
+		strcpy(request.data.queryString, queryString);
+	}
     if(strcmp(request.resource,"/") == 0)
     {
         strcpy(request.resource,"/index.html");
     }
-    fprintf(stderr,"%s\n",request.resource);
+    
     if(strcmp(method,"GET") == 0)
     {
         request.method = HTTP_GET;
+		//request.data.get.queryString = strchr(request.resource,'?');
+				
     } 
     else if(strcmp(method,"POST") == 0)
     {
@@ -400,6 +461,7 @@ parseRequest(const char* data)
     return request;
     
 }
+
 
 static void 
 sendResponse(struct HttpConnection* connection, HttpResponse response)
@@ -488,7 +550,7 @@ next_dir:
     fprintf(stderr,"Resource size: %lu\n",contentSize);
     free(path);    
     close(file);
-    return size;
+    return contentSize;
 get_content_error:
     errno = 0;
     free(path);
